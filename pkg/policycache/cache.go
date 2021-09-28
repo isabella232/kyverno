@@ -1,6 +1,7 @@
 package policycache
 
 import (
+	"sort"
 	"strings"
 	"sync"
 
@@ -50,6 +51,8 @@ type Interface interface {
 	// If the namespace is empty, only cluster-wide policies are returned
 	GetPolicies(pkey PolicyType, kind string, nspace string) []*kyverno.ClusterPolicy
 
+	GetKinds() []string
+
 	get(pkey PolicyType, kind string, nspace string) []string
 }
 
@@ -78,6 +81,26 @@ func newPolicyCache(log logr.Logger, pLister kyvernolister.ClusterPolicyLister, 
 func (pc *policyCache) Add(policy *kyverno.ClusterPolicy) {
 	pc.pMap.add(policy)
 	pc.Logger.V(4).Info("policy is added to cache", "name", policy.GetName())
+}
+
+func (pc *policyCache) GetKinds() []string {
+	pc.pMap.Lock()
+	defer pc.pMap.Unlock()
+
+	kinds := make([]string, 0, len(pc.kindDataMap))
+	for kind, policyTypeMap := range pc.kindDataMap {
+		count := 0
+		for _, sar := range policyTypeMap {
+			count += len(sar)
+		}
+		if count > 0 {
+			kinds = append(kinds, kind)
+		}
+	}
+	sort.Strings(kinds)
+	pc.Logger.V(4).Info("==========================================================")
+	pc.Logger.V(4).Info("GetKinds returns", "kindDataMap.Keys()", strings.Join(kinds, ","))
+	return kinds
 }
 
 // Get the list of matched policies

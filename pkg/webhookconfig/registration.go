@@ -10,6 +10,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/kyverno/kyverno/pkg/config"
 	client "github.com/kyverno/kyverno/pkg/dclient"
+	"github.com/kyverno/kyverno/pkg/policycache"
 	"github.com/kyverno/kyverno/pkg/resourcecache"
 	"github.com/kyverno/kyverno/pkg/tls"
 	"github.com/pkg/errors"
@@ -34,14 +35,14 @@ const (
 // 4. Resource Mutation
 // 5. Webhook Status Mutation
 type Register struct {
-	client         *client.Client
-	clientConfig   *rest.Config
-	resCache       resourcecache.ResourceCache
-	serverIP       string // when running outside a cluster
-	timeoutSeconds int32
-	log            logr.Logger
-	debug          bool
-
+	client            *client.Client
+	clientConfig      *rest.Config
+	resCache          resourcecache.ResourceCache
+	serverIP          string // when running outside a cluster
+	timeoutSeconds    int32
+	log               logr.Logger
+	debug             bool
+	policyCache       policycache.Interface
 	UpdateWebhookChan chan bool
 }
 
@@ -53,6 +54,7 @@ func NewRegister(
 	serverIP string,
 	webhookTimeout int32,
 	debug bool,
+	policyCache policycache.Interface,
 	log logr.Logger) *Register {
 	return &Register{
 		clientConfig:      clientConfig,
@@ -62,7 +64,17 @@ func NewRegister(
 		timeoutSeconds:    webhookTimeout,
 		log:               log.WithName("Register"),
 		debug:             debug,
+		policyCache:       policyCache,
 		UpdateWebhookChan: make(chan bool),
+	}
+}
+
+func (wrc *Register) UpdateWebhooks() {
+	select {
+	case wrc.UpdateWebhookChan <- true:
+		wrc.log.V(4).Info("Register.UpdateWebHooks sent true!")
+	default:
+		wrc.log.V(4).Info("Register.UpdateWebHooks would have blocked...")
 	}
 }
 
@@ -136,6 +148,17 @@ func (wrc *Register) Check() error {
 	if _, err := validatingCache.Lister().Get(wrc.getPolicyValidatingWebhookConfigurationName()); err != nil {
 		return err
 	}
+	return nil
+}
+
+func (wrc *Register) CheckResources() error {
+	if err := wrc.checkRuleResources(kindMutating, wrc.getResourceMutatingWebhookConfigName()); err != nil {
+		return errors.Wrap(err, "check resources mutating")
+	}
+
+	if err := wrc.checkRuleResources(kindValidating, wrc.getResourceValidatingWebhookConfigName()); err != nil {
+		return errors.Wrap(err, "check resources validating")
+	}
 
 	return nil
 }
@@ -151,6 +174,21 @@ func (wrc *Register) Remove(cleanUp chan<- struct{}) {
 	wrc.removeSecrets()
 }
 
+func (wrc *Register) getResourceWebhookRules() []interface{} {
+	kinds := wrc.policyCache.GetKinds()
+	logger := wrc.log.WithName("getResourceWebhookRules")
+	result := make([]interface{}, 0, len(kinds))
+	for _, kind := range kinds {
+		_, gvr, err := wrc.client.DiscoveryClient.FindResource("", kind)
+		if err != nil {
+			logger.V(4).Info("error discovery client findresource", "gvr", gvr, "kind", kind)
+			continue
+		}
+		result = append(result, gvr.Resource) // strings.ToLower(kind)+"s/*", strings.ToLower(kind)+"/*")
+	}
+	return result
+}
+
 // UpdateWebhookConfigurations updates resource webhook configurations dynamically
 // base on the UPDATEs of Kyverno init-config ConfigMap
 //
@@ -158,7 +196,16 @@ func (wrc *Register) Remove(cleanUp chan<- struct{}) {
 func (wrc *Register) UpdateWebhookConfigurations(configHandler config.Interface) {
 	logger := wrc.log.WithName("UpdateWebhookConfigurations")
 	for {
-		<-wrc.UpdateWebhookChan
+		select {
+		case <-wrc.UpdateWebhookChan:
+		case <-time.After(55 * time.Second):
+		}
+		for i := 0; i < 5; i++ {
+			select {
+			case <-wrc.UpdateWebhookChan:
+			case <-time.After(time.Second):
+			}
+		}
 		logger.Info("received the signal to update webhook configurations")
 
 		var nsSelector map[string]interface{}
@@ -179,14 +226,12 @@ func (wrc *Register) UpdateWebhookConfigurations(configHandler config.Interface)
 
 		if err := wrc.updateResourceMutatingWebhookConfiguration(nsSelector); err != nil {
 			logger.Error(err, "unable to update mutatingWebhookConfigurations", "name", wrc.getResourceMutatingWebhookConfigName())
-			go func() { wrc.UpdateWebhookChan <- true }()
 		} else {
 			logger.Info("successfully updated mutatingWebhookConfigurations", "name", wrc.getResourceMutatingWebhookConfigName())
 		}
 
 		if err := wrc.updateResourceValidatingWebhookConfiguration(nsSelector); err != nil {
 			logger.Error(err, "unable to update validatingWebhookConfigurations", "name", wrc.getResourceValidatingWebhookConfigName())
-			go func() { wrc.UpdateWebhookChan <- true }()
 		} else {
 			logger.Info("successfully updated validatingWebhookConfigurations", "name", wrc.getResourceValidatingWebhookConfigName())
 		}
@@ -621,17 +666,57 @@ func (wrc *Register) checkEndpoint() error {
 	return err
 }
 
-func (wrc *Register) updateResourceValidatingWebhookConfiguration(nsSelector map[string]interface{}) error {
-	validatingCache, _ := wrc.resCache.GetGVRCache(kindValidating)
+func generateWebhookRule(apiGroups, apiVersions, resources, operationTypes []interface{}) map[string]interface{} {
+	return map[string]interface{}{
+		"operations":  operationTypes,
+		"apiVersions": apiVersions,
+		"apiGroups":   apiGroups,
+		"resources":   resources,
+	}
+}
 
-	resourceValidating, err := validatingCache.Lister().Get(wrc.getResourceValidatingWebhookConfigName())
+func (wrc *Register) checkRuleResources(kind, name string) error {
+	_, webhook, err := wrc.getWebhookFromCache(kind, name)
 	if err != nil {
-		return errors.Wrapf(err, "unable to get validatingWebhookConfigurations")
+		return errors.Wrapf(err, "checkRuleResources fail")
 	}
 
-	webhooksUntyped, _, err := unstructured.NestedSlice(resourceValidating.UnstructuredContent(), "webhooks")
+	rules, ok, err := unstructured.NestedSlice(*webhook, "rules")
+	if err != nil || !ok || len(rules) == 0 {
+		return errors.Wrapf(err, "checkRuleResources no rules")
+	}
+	rule, ok := rules[0].(map[string]interface{})
+	if !ok {
+		return errors.Wrapf(err, "checkRuleResources rule type mismatch got %T", rules[0])
+	}
+	resources, ok, err := unstructured.NestedStringSlice(rule, "resources")
+	if !ok || err != nil || len(resources) == 0 {
+		return errors.Wrapf(err, "checkRuleResources resources")
+	}
+
+	kinds := wrc.policyCache.GetKinds()
+	if len(kinds) != len(resources) {
+		return errors.Wrapf(err, "checkRuleResources len diff")
+	}
+
+	for i := 0; i < len(kinds); i++ {
+		if kinds[i] != resources[i] {
+			return errors.Wrapf(err, "checkRuleResources kind diff")
+		}
+	}
+	return nil
+}
+
+func (wrc *Register) getWebhookFromCache(kind, name string) (*unstructured.Unstructured, *map[string]interface{}, error) {
+	cache, _ := wrc.resCache.GetGVRCache(kind)
+	res, err := cache.Lister().Get(name)
 	if err != nil {
-		return errors.Wrapf(err, "unable to load validatingWebhookConfigurations.webhooks")
+		return res, nil, errors.Wrapf(err, "unable to fetch webhook from cache")
+	}
+
+	webhooksUntyped, _, err := unstructured.NestedSlice(res.UnstructuredContent(), "webhooks")
+	if err != nil {
+		return res, nil, errors.Wrapf(err, "unable to load webhookConfig.webhooks")
 	}
 
 	var webhooks map[string]interface{}
@@ -639,14 +724,34 @@ func (wrc *Register) updateResourceValidatingWebhookConfiguration(nsSelector map
 	if webhooksUntyped != nil {
 		webhooks, ok = webhooksUntyped[0].(map[string]interface{})
 		if !ok {
-			return errors.Wrapf(err, "type mismatched, expected map[string]interface{}, got %T", webhooksUntyped[0])
+			return res, nil, errors.Wrapf(err, "type mismatched, expected map[string]interface{}, got %T", webhooksUntyped[0])
 		}
+		return res, &webhooks, nil
 	}
-	if err = unstructured.SetNestedMap(webhooks, nsSelector, "namespaceSelector"); err != nil {
+	return res, &webhooks, nil
+}
+
+func (wrc *Register) updateResourceValidatingWebhookConfiguration(nsSelector map[string]interface{}) error {
+	resourceValidating, webhooks, err := wrc.getWebhookFromCache(kindValidating, wrc.getResourceValidatingWebhookConfigName())
+	if err != nil {
+		return errors.Wrapf(err, "unable to get validatingWebhookConfigurations")
+	}
+
+	webhookRule := generateWebhookRule(
+		[]interface{}{"*"},
+		[]interface{}{"*"},
+		wrc.getResourceWebhookRules(),
+		[]interface{}{string(admregapi.Create), string(admregapi.Update), string(admregapi.Connect), string(admregapi.Delete)})
+
+	if err = unstructured.SetNestedSlice(*webhooks, []interface{}{webhookRule}, "rules"); err != nil {
+		return errors.Wrapf(err, "unable to set validating.webhooks[0].rules[]")
+	}
+
+	if err = unstructured.SetNestedMap(*webhooks, nsSelector, "namespaceSelector"); err != nil {
 		return errors.Wrapf(err, "unable to set validatingWebhookConfigurations.webhooks[0].namespaceSelector")
 	}
 
-	if err = unstructured.SetNestedSlice(resourceValidating.UnstructuredContent(), []interface{}{webhooks}, "webhooks"); err != nil {
+	if err = unstructured.SetNestedSlice(resourceValidating.UnstructuredContent(), []interface{}{*webhooks}, "webhooks"); err != nil {
 		return errors.Wrapf(err, "unable to set validatingWebhookConfigurations.webhooks")
 	}
 
@@ -658,31 +763,26 @@ func (wrc *Register) updateResourceValidatingWebhookConfiguration(nsSelector map
 }
 
 func (wrc *Register) updateResourceMutatingWebhookConfiguration(nsSelector map[string]interface{}) error {
-	mutatingCache, _ := wrc.resCache.GetGVRCache(kindMutating)
-
-	resourceMutating, err := mutatingCache.Lister().Get(wrc.getResourceMutatingWebhookConfigName())
+	resourceMutating, webhooks, err := wrc.getWebhookFromCache(kindMutating, wrc.getResourceMutatingWebhookConfigName())
 	if err != nil {
 		return errors.Wrapf(err, "unable to get mutatingWebhookConfigurations")
 	}
 
-	webhooksUntyped, _, err := unstructured.NestedSlice(resourceMutating.UnstructuredContent(), "webhooks")
-	if err != nil {
-		return errors.Wrapf(err, "unable to load mutatingWebhookConfigurations.webhooks")
+	webhookRule := generateWebhookRule(
+		[]interface{}{"*"},
+		[]interface{}{"*"},
+		wrc.getResourceWebhookRules(),
+		[]interface{}{string(admregapi.Create), string(admregapi.Update)})
+
+	if err = unstructured.SetNestedSlice(*webhooks, []interface{}{webhookRule}, "rules"); err != nil {
+		return errors.Wrapf(err, "unable to set mutatingWebhookConfigurations.webhooks[0].rules[]")
 	}
 
-	var webhooks map[string]interface{}
-	var ok bool
-	if webhooksUntyped != nil {
-		webhooks, ok = webhooksUntyped[0].(map[string]interface{})
-		if !ok {
-			return errors.Wrapf(err, "type mismatched, expected map[string]interface{}, got %T", webhooksUntyped[0])
-		}
-	}
-	if err = unstructured.SetNestedMap(webhooks, nsSelector, "namespaceSelector"); err != nil {
+	if err = unstructured.SetNestedMap(*webhooks, nsSelector, "namespaceSelector"); err != nil {
 		return errors.Wrapf(err, "unable to set mutatingWebhookConfigurations.webhooks[0].namespaceSelector")
 	}
 
-	if err = unstructured.SetNestedSlice(resourceMutating.UnstructuredContent(), []interface{}{webhooks}, "webhooks"); err != nil {
+	if err = unstructured.SetNestedSlice(resourceMutating.UnstructuredContent(), []interface{}{*webhooks}, "webhooks"); err != nil {
 		return errors.Wrapf(err, "unable to set mutatingWebhookConfigurations.webhooks")
 	}
 

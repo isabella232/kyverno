@@ -123,6 +123,7 @@ type Interface interface {
 	RestrictDevelopmentUsername() []string
 	FilterNamespaces(namespaces []string) []string
 	GetWebhooks() []WebhookConfig
+	UpdateWebhooks()
 	GetInitConfigMapName() string
 }
 
@@ -204,6 +205,13 @@ func (cd *ConfigData) updateCM(old, cur interface{}) {
 	if updateWebook {
 		cd.log.Info("webhook configurations changed, updating webhook configurations")
 		cd.updateWebhookConfigurations <- true
+	}
+}
+
+func (cd *ConfigData) UpdateWebhooks() {
+	select {
+	case cd.updateWebhookConfigurations <- true:
+	default:
 	}
 }
 

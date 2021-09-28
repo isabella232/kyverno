@@ -989,7 +989,7 @@ func GetKindsFromPolicy(policy *v1.ClusterPolicy) map[string]struct{} {
 		}
 		for _, kind := range rule.ExcludeResources.ResourceDescription.Kinds {
 			kindOnwhichPolicyIsApplied[kind] = struct{}{}
-		}
+		} // XXX WTF
 	}
 	return kindOnwhichPolicyIsApplied
 }

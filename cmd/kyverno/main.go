@@ -5,12 +5,13 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
-	_ "net/http/pprof"
+	"net/http/pprof"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/kyverno/kyverno/pkg/cosign"
+	"github.com/kyverno/kyverno/pkg/policycache"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	kubeinformers "k8s.io/client-go/informers"
@@ -31,7 +32,6 @@ import (
 	"github.com/kyverno/kyverno/pkg/metrics"
 	"github.com/kyverno/kyverno/pkg/openapi"
 	"github.com/kyverno/kyverno/pkg/policy"
-	"github.com/kyverno/kyverno/pkg/policycache"
 	"github.com/kyverno/kyverno/pkg/policyreport"
 	"github.com/kyverno/kyverno/pkg/resourcecache"
 	"github.com/kyverno/kyverno/pkg/signal"
@@ -107,6 +107,11 @@ func main() {
 		profilingServerMux = http.NewServeMux()
 		addr := ":" + profilePort
 		setupLog.Info("Enable profiling, see details at https://github.com/kyverno/kyverno/wiki/Profiling-Kyverno-on-Kubernetes", "port", profilePort)
+		profilingServerMux.HandleFunc("/debug/pprof/", pprof.Index)
+		profilingServerMux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		profilingServerMux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		profilingServerMux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		profilingServerMux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 		go func() {
 			if err := http.ListenAndServe(addr, profilingServerMux); err != nil {
 				setupLog.Error(err, "Failed to enable profiling")
@@ -214,6 +219,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	pCacheController := policycache.NewPolicyCacheController(
+		pInformer.Kyverno().V1().ClusterPolicies(),
+		pInformer.Kyverno().V1().Policies(),
+		log.Log.WithName("PolicyCacheController"),
+	)
+
 	debug := serverIP != ""
 	webhookCfg := webhookconfig.NewRegister(
 		clientConfig,
@@ -222,6 +233,7 @@ func main() {
 		serverIP,
 		int32(webhookTimeout),
 		debug,
+		pCacheController.Cache,
 		log.Log)
 
 	webhookMonitor, err := webhookconfig.NewMonitor(kubeClient, log.Log.WithName("WebhookMonitor"))
@@ -337,12 +349,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	pCacheController := policycache.NewPolicyCacheController(
-		pInformer.Kyverno().V1().ClusterPolicies(),
-		pInformer.Kyverno().V1().Policies(),
-		log.Log.WithName("PolicyCacheController"),
-	)
-
 	auditHandler := webhooks.NewValidateAuditHandler(
 		pCacheController.Cache,
 		eventGenerator,
@@ -386,7 +392,7 @@ func main() {
 			setupLog.Error(err, "Timeout registering admission control webhooks")
 			os.Exit(1)
 		}
-		webhookCfg.UpdateWebhookChan <- true
+		webhookCfg.UpdateWebhooks()
 	}
 
 	// leader election context
